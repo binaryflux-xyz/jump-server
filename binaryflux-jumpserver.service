@@ -1,0 +1,16 @@
+[Unit]
+Description=Jump Server Relay
+After=network.target
+
+[Service]
+ExecStart=/opt/binaryflux-jumpserver/runtime/bin/java \
+    -Dio.netty.macAddress.useRandom=true \
+    -jar /opt/binaryflux-jumpserver/jump.jar /opt/binaryflux-jumpserver/config.yml
+WorkingDirectory=/opt/binaryflux-jumpserver
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

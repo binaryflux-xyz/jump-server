@@ -1,0 +1,25 @@
+tls_profile:
+  client_cert: certs/client-cert.pem
+  client_key: certs/client-key.pem
+  ca_cert: certs/ca.pem
+  server_name: <SERVER_NAME>
+
+routes:
+  - name: windows
+    listen:
+      ip: "0.0.0.0"
+      port: 9999
+      protocol: tcp
+    forward:
+      host: <BACKEND_SERVICE_IP_OR_HOST>
+      port: <BACKEND_SERVICE_PORT>
+      tls: true         # Optional; default is true
+  - name: linux
+    listen:
+      ip: "0.0.0.0"
+      port: 9998
+      protocol: tcp
+    forward:
+      host: <BACKEND_SERVICE_IP_OR_HOST>
+      port: <BACKEND_SERVICE_PORT>
+      tls: true
