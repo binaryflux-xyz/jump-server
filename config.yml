@@ -4,6 +4,13 @@ tls_profile:
   ca_cert: certs/ca.pem
   server_name: <SERVER_NAME>
 
+# Batching configuration
+batch_config:
+  max_batch_size: 1000        # Maximum number of records per batch
+  max_batch_bytes: 1048576    # Maximum bytes per batch (1MB)
+  flush_interval_ms: 1000     # Flush interval in milliseconds
+  enable_compression: true    # Enable GZIP compression
+  
 routes:
   - name: windows
     listen:

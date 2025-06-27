@@ -60,12 +60,20 @@ This guide explains how to install, configure, and manage the BinaryFlux Jump Se
     ```
 2. Place the certs folder provided by Binaryflux into this extracted jump-server-bundle
 3. Review and edit the config.yml:
-```
+
+```yaml
 tls_profile:
   client_cert: certs/client-cert.pem
   client_key: certs/client-key.pem
   ca_cert: certs/ca.pem
   server_name: <SERVER_NAME>
+
+# Batching configuration (optional)
+batch_config:
+  max_batch_size: 1000        # Maximum number of records per batch
+  max_batch_bytes: 1048576    # Maximum bytes per batch (1MB)
+  flush_interval_ms: 1000     # Flush interval in milliseconds
+  enable_compression: true    # Enable GZIP compression
 
 routes:
   - name: windows
@@ -87,6 +95,32 @@ routes:
       port: <BACKEND_SERVICE_PORT>
       tls: true
 ```
+
+## 🔄 Batching and Compression Features
+
+The Jump Server now supports advanced batching and compression features to optimize network performance:
+
+### Batch Configuration Options
+
+- **`max_batch_size`**: Maximum number of records to accumulate before sending (default: 1000)
+- **`max_batch_bytes`**: Maximum total bytes to accumulate before sending (default: 1MB)
+- **`flush_interval_ms`**: Time interval in milliseconds to flush batches (default: 1000ms)
+- **`enable_compression`**: Enable GZIP compression for batched data (default: true)
+
+### How Batching Works
+
+1. **Record Accumulation**: Incoming data is accumulated in memory until batch limits are reached
+2. **Compression**: When enabled, batched data is compressed using GZIP before transmission
+3. **Scheduled Flushing**: Batches are automatically flushed at regular intervals
+4. **Size-based Flushing**: Batches are immediately flushed when size limits are exceeded
+
+### Benefits
+
+- **Reduced Network Overhead**: Fewer TCP connections and headers
+- **Improved Throughput**: Compression reduces bandwidth usage
+- **Better Latency Control**: Configurable flush intervals balance latency vs. efficiency
+- **Memory Efficiency**: Automatic memory management with configurable limits
+
 ✏️ You can define one or more input ports under sources, and one or more backend destinations under destinations.
 
 4. Run the installer:
