@@ -71,6 +71,7 @@ public class JumpServer {
         public int max_batch_bytes = 1024 * 1024; // Maximum bytes per batch (1MB)
         public long flush_interval_ms = 1000;    // Flush interval in milliseconds
         public boolean enable_compression = true; // Enable GZIP compression
+        public boolean enable_batching = true;    // Enable batching (default true)
     }
 
     /* ---------- Bootstrap ---------- */
@@ -194,10 +195,19 @@ public class JumpServer {
         BatchedForwarder(Channel inbound, BatchConfig batchConfig) {
             this.inbound = inbound;
             this.batchConfig = batchConfig;
-            scheduleFlush();
+            if (batchConfig.enable_batching) {
+                scheduleFlush();
+            }
         }
 
         @Override public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            if (!batchConfig.enable_batching) {
+                // Send immediately, no compression
+                if (msg instanceof ByteBuf) {
+                    inbound.writeAndFlush(msg);
+                }
+                return;
+            }
             // Forward response data back to the inbound channel
             inbound.writeAndFlush(msg);
         }
@@ -275,15 +285,23 @@ public class JumpServer {
                 final int recordCount = records.size();
                 inbound.writeAndFlush(compressedData).addListener((ChannelFuture future) -> {
                     if (!future.isSuccess()) {
-                        if (recordCount > 1) {
+                        Throwable cause = future.cause();
+                        boolean isClosed = cause instanceof java.nio.channels.ClosedChannelException ||
+                                           (cause != null && cause.getClass().getSimpleName().contains("ClosedChannelException"));
+                        if (recordCount > 1 && !isClosed) {
                             int mid = recordCount / 2;
                             java.util.List<ByteBuf> left = records.subList(0, mid);
                             java.util.List<ByteBuf> right = records.subList(mid, recordCount);
                             sendBatchWithSplit(new java.util.ArrayList<>(left));
                             sendBatchWithSplit(new java.util.ArrayList<>(right));
                         } else {
-                            System.err.printf("Failed to send single record: %s%n", future.cause());
-                            records.get(0).release();
+                            if (isClosed) {
+                                System.err.printf("Channel closed, writing failed record(s) to temp file: %s%n", cause);
+                                RetryFileUtil.writeFailedBatch(records, batchConfig.enable_compression);
+                            } else {
+                                System.err.printf("Failed to send single record: %s%n", cause);
+                            }
+                            for (ByteBuf buf : records) buf.release();
                         }
                     } else {
                         for (ByteBuf buf : records) buf.release();
@@ -341,22 +359,50 @@ public class JumpServer {
 
         @Override public void channelActive(ChannelHandlerContext ctx) {
             this.ctx = ctx;
-            scheduleFlush();
+            if (batchConfig.enable_batching) {
+                scheduleFlush();
+            }
         }
 
         @Override protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket pkt) {
+            if (!batchConfig.enable_batching) {
+                // Send immediately, no compression, via TCP
+                sendSingleViaTcp(ctx, pkt.content());
+                return;
+            }
             int msgSize = pkt.content().readableBytes();
-            
             // Check if adding this message would exceed batch limits
             if (currentBatchSize >= batchConfig.max_batch_size || 
                 currentBatchBytes + msgSize >= batchConfig.max_batch_bytes) {
                 flushBatch(ctx);
             }
-            
             // Add to batch (retain the content)
             batchQueue.offer(new DatagramPacket(pkt.content().retain(), pkt.sender()));
             currentBatchSize++;
             currentBatchBytes += msgSize;
+        }
+
+        private void sendSingleViaTcp(ChannelHandlerContext ctx, ByteBuf data) {
+            Bootstrap b = new Bootstrap()
+                    .group(ctx.channel().eventLoop())
+                    .channel(NioSocketChannel.class)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override protected void initChannel(SocketChannel ch) {
+                            if (useTls()) ch.pipeline().addLast(
+                                    sslCtx.newHandler(ch.alloc(),
+                                            route.forward.host, route.forward.port));
+                        }
+                        private boolean useTls() {
+                            return route.forward.tls == null || route.forward.tls;
+                        }
+                    });
+            b.connect(route.forward.host, route.forward.port).addListener((ChannelFuture f) -> {
+                if (f.isSuccess()) {
+                    f.channel().writeAndFlush(data.retain()).addListener(ChannelFutureListener.CLOSE);
+                } else {
+                    data.release();
+                }
+            });
         }
 
         @Override public void channelInactive(ChannelHandlerContext ctx) {
