@@ -263,40 +263,37 @@ public class JumpServer {
             if (records.isEmpty()) return;
             ByteBufAllocator alloc = inbound.alloc();
             ByteBuf batchData = alloc.buffer();
-            for (ByteBuf buf : records) {
-                batchData.writeBytes(buf.slice());
-            }
-            ByteBuf compressedData = batchData;
             try {
+                for (ByteBuf buf : records) {
+                    batchData.writeBytes(buf, buf.readerIndex(), buf.readableBytes());
+                }
+                ByteBuf compressedData = batchData;
                 if (batchConfig.enable_compression && batchData.readableBytes() > 0) {
                     compressedData = compressData(batchData, alloc);
                     batchData.release();
                 }
-            } catch (IOException e) {
-                System.err.printf("Compression error: %s%n", e.getMessage());
-                batchData.release();
-                return;
-            }
-            final int recordCount = records.size();
-            inbound.writeAndFlush(compressedData).addListener((ChannelFuture future) -> {
-                if (!future.isSuccess()) {
-                    if (recordCount > 1) {
-                        // Split and retry
-                        int mid = recordCount / 2;
-                        java.util.List<ByteBuf> left = records.subList(0, mid);
-                        java.util.List<ByteBuf> right = records.subList(mid, recordCount);
-                        sendBatchWithSplit(new java.util.ArrayList<>(left));
-                        sendBatchWithSplit(new java.util.ArrayList<>(right));
+                final int recordCount = records.size();
+                inbound.writeAndFlush(compressedData).addListener((ChannelFuture future) -> {
+                    if (!future.isSuccess()) {
+                        if (recordCount > 1) {
+                            int mid = recordCount / 2;
+                            java.util.List<ByteBuf> left = records.subList(0, mid);
+                            java.util.List<ByteBuf> right = records.subList(mid, recordCount);
+                            sendBatchWithSplit(new java.util.ArrayList<>(left));
+                            sendBatchWithSplit(new java.util.ArrayList<>(right));
+                        } else {
+                            System.err.printf("Failed to send single record: %s%n", future.cause());
+                            records.get(0).release();
+                        }
                     } else {
-                        // Single record failed, log and release
-                        System.err.printf("Failed to send single record: %s%n", future.cause());
-                        records.get(0).release();
+                        for (ByteBuf buf : records) buf.release();
                     }
-                } else {
-                    // Success, release all
-                    for (ByteBuf buf : records) buf.release();
-                }
-            });
+                });
+            } catch (Throwable t) {
+                batchData.release();
+                for (ByteBuf buf : records) buf.release();
+                System.err.printf("Error in sendBatchWithSplit: %s%n", t.getMessage());
+            }
         }
 
         private ByteBuf compressData(ByteBuf data, ByteBufAllocator alloc) throws IOException {
@@ -404,22 +401,21 @@ public class JumpServer {
             if (records.isEmpty()) return;
             ByteBufAllocator alloc = ctx.alloc();
             ByteBuf batchData = alloc.buffer();
-            for (DatagramPacket pkt : records) {
-                batchData.writeBytes(pkt.content().slice());
-            }
-            ByteBuf compressedData = batchData;
             try {
+                for (DatagramPacket pkt : records) {
+                    batchData.writeBytes(pkt.content(), pkt.content().readerIndex(), pkt.content().readableBytes());
+                }
+                ByteBuf compressedData = batchData;
                 if (batchConfig.enable_compression && batchData.readableBytes() > 0) {
                     compressedData = compressData(batchData, alloc);
                     batchData.release();
                 }
-            } catch (IOException e) {
-                System.err.printf("Compression error: %s%n", e.getMessage());
+                sendBatchViaTcp(ctx, compressedData, records);
+            } catch (Throwable t) {
                 batchData.release();
-                return;
+                for (DatagramPacket pkt : records) pkt.content().release();
+                System.err.printf("Error in sendBatchWithSplit (UDP): %s%n", t.getMessage());
             }
-            
-            sendBatchViaTcp(ctx, compressedData, records);
         }
 
         private void sendBatchViaTcp(ChannelHandlerContext ctx, ByteBuf data, java.util.List<DatagramPacket> records) {
@@ -436,31 +432,28 @@ public class JumpServer {
                             return route.forward.tls == null || route.forward.tls;
                         }
                     });
-
             final int recordCount = records.size();
             b.connect(route.forward.host, route.forward.port).addListener((ChannelFuture f) -> {
                 if (f.isSuccess()) {
                     f.channel().writeAndFlush(data).addListener(future -> {
                         if (!future.isSuccess()) {
                             if (recordCount > 1) {
-                                // Split and retry
                                 int mid = recordCount / 2;
                                 java.util.List<DatagramPacket> left = records.subList(0, mid);
                                 java.util.List<DatagramPacket> right = records.subList(mid, recordCount);
                                 sendBatchWithSplit(ctx, new java.util.ArrayList<>(left));
                                 sendBatchWithSplit(ctx, new java.util.ArrayList<>(right));
                             } else {
-                                // Single record failed, log and release
                                 System.err.printf("Failed to send single UDP record: %s%n", future.cause());
                                 records.get(0).content().release();
                             }
                         } else {
-                            // Success, release all
                             for (DatagramPacket pkt : records) pkt.content().release();
                         }
                     });
                 } else {
                     data.release();
+                    for (DatagramPacket pkt : records) pkt.content().release();
                 }
             });
         }
