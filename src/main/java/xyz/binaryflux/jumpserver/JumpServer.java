@@ -6,7 +6,6 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.ByteBufOutputStream;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.*;
@@ -48,6 +47,7 @@ public class JumpServer {
     public static final class Forward {
         public String host;
         public int    port;
+        public String protocol = "tcp";  // "tcp" | "udp" (default: tcp)
         public Boolean tls = null;  // null=default(true), false=plain
     }
 
@@ -134,6 +134,7 @@ public class JumpServer {
         private final BatchConfig batchConfig;
         private ChannelHandlerContext clientCtx;
         private ScheduledFuture<?> reconnectTask;
+        private ScheduledFuture<?> cleanupTask;
         private boolean isReconnecting = false;
         private final ConcurrentLinkedQueue<ByteBuf> pendingMessages = new ConcurrentLinkedQueue<>();
 
@@ -182,6 +183,9 @@ public class JumpServer {
                         System.err.printf("[DEBUG] Backend connection closed%n");
                         outbound = null;
                         
+                        // Clean up any remaining pending messages
+                        cleanupPendingMessages();
+                        
                         if (batchConfig.persistent_reconnection && clientCtx != null && clientCtx.channel().isActive()) {
                             scheduleReconnect();
                         }
@@ -191,6 +195,9 @@ public class JumpServer {
                 } else {
                     System.err.printf("[DEBUG] Connection failed: %s%n", f.cause().getMessage());
                     isReconnecting = false;
+                    
+                    // Clean up pending messages on connection failure
+                    cleanupPendingMessages();
                     
                     if (batchConfig.persistent_reconnection && clientCtx != null && clientCtx.channel().isActive()) {
                         scheduleReconnect();
@@ -232,6 +239,20 @@ public class JumpServer {
                     break;
                 }
             }
+            
+            // Cancel cleanup task if all messages were processed
+            if (pendingMessages.isEmpty() && cleanupTask != null && !cleanupTask.isDone()) {
+                cleanupTask.cancel(false);
+                System.err.printf("[DEBUG] Cancelled cleanup task - all messages processed%n");
+            }
+        }
+        
+        private void cleanupPendingMessages() {
+            System.err.printf("[DEBUG] Cleaning up %d pending messages%n", pendingMessages.size());
+            ByteBuf msg;
+            while ((msg = pendingMessages.poll()) != null) {
+                msg.release();
+            }
         }
         
         private void scheduleReconnect() {
@@ -257,6 +278,14 @@ public class JumpServer {
                 // Queue message for retry when connection is restored
                 if (msg instanceof ByteBuf) {
                     pendingMessages.offer(((ByteBuf) msg).retain());
+                    
+                    // Schedule cleanup after 30 seconds if messages aren't processed
+                    if (cleanupTask == null || cleanupTask.isDone()) {
+                        cleanupTask = ctx.executor().schedule(
+                            this::cleanupPendingMessages,
+                            30, TimeUnit.SECONDS
+                        );
+                    }
                 }
             }
         }
@@ -266,13 +295,18 @@ public class JumpServer {
             if (reconnectTask != null) {
                 reconnectTask.cancel(false);
             }
-            if (outbound != null) outbound.close();
-            
-            // Release any pending messages
-            ByteBuf msg;
-            while ((msg = pendingMessages.poll()) != null) {
-                msg.release();
+            if (cleanupTask != null) {
+                cleanupTask.cancel(false);
             }
+            
+            // Don't close outbound immediately, let pending messages be processed
+            // Only close if we're not in the middle of connecting
+            if (outbound != null && !isReconnecting) {
+                outbound.close();
+            }
+            
+            // Don't release pending messages immediately - let them be processed
+            // They will be released when the connection is fully closed or timeout
         }
 
         private boolean useTls() { return route.forward.tls == null || route.forward.tls; }
@@ -564,6 +598,8 @@ public class JumpServer {
         private ScheduledFuture<?> flushTask;
         private ScheduledFuture<?> retryTask;
         private ChannelHandlerContext ctx;
+        private Channel tcpConnection;
+        private boolean isConnecting = false;
 
         BatchedUdpHandler(Route route, SslContext sslCtx, BatchConfig batchConfig) {
             this.route = route;
@@ -577,6 +613,70 @@ public class JumpServer {
                 scheduleFlush();
             }
             scheduleRetryTask();
+            // Establish persistent TCP connection
+            establishTcpConnection();
+        }
+
+        private void establishTcpConnection() {
+            if (isConnecting || (tcpConnection != null && tcpConnection.isActive())) {
+                return;
+            }
+            
+            // Check if we should use UDP forwarding
+            if ("udp".equalsIgnoreCase(route.forward.protocol)) {
+                System.err.printf("[DEBUG] UDP: Using UDP forwarding to %s:%d%n", 
+                    route.forward.host, route.forward.port);
+                return; // No TCP connection needed for UDP forwarding
+            }
+            
+            isConnecting = true;
+            System.err.printf("[DEBUG] UDP: Establishing persistent TCP connection to %s:%d%n", 
+                route.forward.host, route.forward.port);
+            
+            Bootstrap b = new Bootstrap()
+                    .group(ctx.channel().eventLoop())
+                    .channel(NioSocketChannel.class)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override protected void initChannel(SocketChannel ch) {
+                            if (useTls()) ch.pipeline().addLast(
+                                    sslCtx.newHandler(ch.alloc(),
+                                            route.forward.host, route.forward.port));
+                        }
+                        private boolean useTls() {
+                            return route.forward.tls == null || route.forward.tls;
+                        }
+                    });
+            
+            b.connect(route.forward.host, route.forward.port).addListener((ChannelFuture f) -> {
+                isConnecting = false;
+                if (f.isSuccess()) {
+                    tcpConnection = f.channel();
+                    System.err.printf("[DEBUG] UDP: Persistent TCP connection established%n");
+                    
+                    // Add connection close listener
+                    tcpConnection.closeFuture().addListener((ChannelFuture closeFuture) -> {
+                        System.err.printf("[DEBUG] UDP: TCP connection closed, will reconnect%n");
+                        tcpConnection = null;
+                        // Reconnect after a delay
+                        ctx.executor().schedule(
+                            () -> establishTcpConnection(),
+                            batchConfig.connection_retry_delay_ms,
+                            TimeUnit.MILLISECONDS
+                        );
+                    });
+                    
+                    // Process any pending retry messages
+                    processRetryQueue();
+                } else {
+                    System.err.printf("[DEBUG] UDP: TCP connection failed: %s%n", f.cause().getMessage());
+                    // Retry connection after delay
+                    ctx.executor().schedule(
+                        () -> establishTcpConnection(),
+                        batchConfig.connection_retry_delay_ms,
+                        TimeUnit.MILLISECONDS
+                    );
+                }
+            });
         }
 
         @Override protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket pkt) {
@@ -598,58 +698,101 @@ public class JumpServer {
         }
 
         private void sendSingleViaTcpWithRetry(ChannelHandlerContext ctx, ByteBuf data, int attempt) {
+            // Check if we should use UDP forwarding
+            if ("udp".equalsIgnoreCase(route.forward.protocol)) {
+                sendSingleViaUdpWithRetry(ctx, data, attempt);
+                return;
+            }
+            
+            if (tcpConnection != null && tcpConnection.isActive()) {
+                // Use existing persistent connection
+                tcpConnection.writeAndFlush(data.retain()).addListener((ChannelFuture writeFuture) -> {
+                    if (!writeFuture.isSuccess()) {
+                        System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Send failed (attempt %d) - %s%n", 
+                            attempt + 1, writeFuture.cause().getMessage());
+                        
+                        if (attempt < batchConfig.max_send_retries) {
+                            System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
+                            ctx.executor().schedule(
+                                () -> sendSingleViaTcpWithRetry(ctx, data, attempt + 1),
+                                batchConfig.send_retry_delay_ms,
+                                TimeUnit.MILLISECONDS
+                            );
+                        } else {
+                            System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Max retries reached, queuing for later retry%n");
+                            retryQueue.offer(new DatagramPacket(data.retain(), null));
+                            data.release();
+                        }
+                    } else {
+                        System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Successfully sent %d bytes via persistent connection (attempt %d)%n", 
+                            data.readableBytes(), attempt + 1);
+                        data.release();
+                    }
+                });
+            } else {
+                // No persistent connection available, queue for retry
+                System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: No persistent connection, queuing message%n");
+                retryQueue.offer(new DatagramPacket(data.retain(), null));
+                data.release();
+                
+                // Try to establish connection if not already connecting
+                if (!isConnecting) {
+                    establishTcpConnection();
+                }
+            }
+        }
+
+        private void sendSingleViaUdpWithRetry(ChannelHandlerContext ctx, ByteBuf data, int attempt) {
+            System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Sending %d bytes via UDP to %s:%d (attempt %d)%n", 
+                data.readableBytes(), route.forward.host, route.forward.port, attempt + 1);
+            
+            // Create UDP channel for sending
             Bootstrap b = new Bootstrap()
                     .group(ctx.channel().eventLoop())
-                    .channel(NioSocketChannel.class)
-                    .handler(new ChannelInitializer<SocketChannel>() {
-                        @Override protected void initChannel(SocketChannel ch) {
-                            if (useTls()) ch.pipeline().addLast(
-                                    sslCtx.newHandler(ch.alloc(),
-                                            route.forward.host, route.forward.port));
-                        }
-                        private boolean useTls() {
-                            return route.forward.tls == null || route.forward.tls;
-                        }
-                    });
+                    .channel(NioDatagramChannel.class);
+            
             b.connect(route.forward.host, route.forward.port).addListener((ChannelFuture f) -> {
                 if (f.isSuccess()) {
-                    f.channel().writeAndFlush(data.retain()).addListener((ChannelFuture writeFuture) -> {
+                    DatagramPacket packet = new DatagramPacket(data.retain(), 
+                        new InetSocketAddress(route.forward.host, route.forward.port));
+                    
+                    f.channel().writeAndFlush(packet).addListener((ChannelFuture writeFuture) -> {
                         if (!writeFuture.isSuccess()) {
-                            System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Send failed (attempt %d) - %s%n", 
+                            System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Send failed (attempt %d) - %s%n", 
                                 attempt + 1, writeFuture.cause().getMessage());
                             
                             if (attempt < batchConfig.max_send_retries) {
-                                System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
+                                System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
                                 ctx.executor().schedule(
-                                    () -> sendSingleViaTcpWithRetry(ctx, data, attempt + 1),
+                                    () -> sendSingleViaUdpWithRetry(ctx, data, attempt + 1),
                                     batchConfig.send_retry_delay_ms,
                                     TimeUnit.MILLISECONDS
                                 );
                             } else {
-                                System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Max retries reached, queuing for later retry%n");
+                                System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Max retries reached, queuing for later retry%n");
                                 retryQueue.offer(new DatagramPacket(data.retain(), null));
                                 data.release();
                             }
                         } else {
-                            System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Successfully sent %d bytes (attempt %d)%n", 
+                            System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Successfully sent %d bytes via UDP (attempt %d)%n", 
                                 data.readableBytes(), attempt + 1);
                             data.release();
                         }
+                        f.channel().close();
                     });
-                    f.channel().close();
                 } else {
-                    System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Connection failed (attempt %d) - %s%n", 
+                    System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Connection failed (attempt %d) - %s%n", 
                         attempt + 1, f.cause().getMessage());
                     
                     if (attempt < batchConfig.max_send_retries) {
-                        System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Retrying connection in %d ms%n", batchConfig.send_retry_delay_ms);
+                        System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
                         ctx.executor().schedule(
-                            () -> sendSingleViaTcpWithRetry(ctx, data, attempt + 1),
+                            () -> sendSingleViaUdpWithRetry(ctx, data, attempt + 1),
                             batchConfig.send_retry_delay_ms,
                             TimeUnit.MILLISECONDS
                         );
                     } else {
-                        System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Max retries reached, queuing for later retry%n");
+                        System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Max retries reached, queuing for later retry%n");
                         retryQueue.offer(new DatagramPacket(data.retain(), null));
                         data.release();
                     }
@@ -696,6 +839,13 @@ public class JumpServer {
                 retryTask.cancel(false);
             }
             flushBatch(ctx); // Final flush
+            
+            // Close persistent TCP connection
+            if (tcpConnection != null && tcpConnection.isActive()) {
+                System.err.printf("[DEBUG] UDP: Closing persistent TCP connection%n");
+                tcpConnection.close();
+                tcpConnection = null;
+            }
         }
 
         private void scheduleFlush() {
@@ -759,7 +909,7 @@ public class JumpServer {
                     System.err.printf("[DEBUG] UDP sendBatchWithSplit: Compression disabled or empty data%n");
                 }
                 
-                System.err.printf("[DEBUG] UDP sendBatchWithSplit: Sending %d records, %d bytes via TCP%n", 
+                System.err.printf("[DEBUG] UDP sendBatchWithSplit: Sending %d records, %d bytes%n", 
                     records.size(), compressedData.readableBytes());
                 
                 sendBatchViaTcp(ctx, compressedData, records);
@@ -772,24 +922,67 @@ public class JumpServer {
         }
 
         private void sendBatchViaTcp(ChannelHandlerContext ctx, ByteBuf data, java.util.List<DatagramPacket> records) {
+            // Check if we should use UDP forwarding
+            if ("udp".equalsIgnoreCase(route.forward.protocol)) {
+                sendBatchViaUdp(ctx, data, records);
+                return;
+            }
+            
+            final int recordCount = records.size();
+            
+            if (tcpConnection != null && tcpConnection.isActive()) {
+                // Use existing persistent connection
+                tcpConnection.writeAndFlush(data).addListener(future -> {
+                    if (!future.isSuccess()) {
+                        System.err.printf("[DEBUG] UDP sendBatchViaTcp: Send failed - %s%n", future.cause().getMessage());
+                        if (recordCount > 1) {
+                            int mid = recordCount / 2;
+                            java.util.List<DatagramPacket> left = records.subList(0, mid);
+                            java.util.List<DatagramPacket> right = records.subList(mid, recordCount);
+                            sendBatchWithSplit(ctx, new java.util.ArrayList<>(left));
+                            sendBatchWithSplit(ctx, new java.util.ArrayList<>(right));
+                        } else {
+                            System.err.printf("Failed to send single UDP record: %s%n", future.cause());
+                            records.get(0).content().release();
+                        }
+                    } else {
+                        System.err.printf("[DEBUG] UDP sendBatchViaTcp: Successfully sent %d records via persistent connection%n", recordCount);
+                        for (DatagramPacket pkt : records) pkt.content().release();
+                    }
+                });
+            } else {
+                // No persistent connection available, queue for retry
+                System.err.printf("[DEBUG] UDP sendBatchViaTcp: No persistent connection, queuing batch%n");
+                for (DatagramPacket pkt : records) {
+                    retryQueue.offer(new DatagramPacket(pkt.content().retain(), null));
+                }
+                data.release();
+                
+                // Try to establish connection if not already connecting
+                if (!isConnecting) {
+                    establishTcpConnection();
+                }
+            }
+        }
+
+        private void sendBatchViaUdp(ChannelHandlerContext ctx, ByteBuf data, java.util.List<DatagramPacket> records) {
+            final int recordCount = records.size();
+            System.err.printf("[DEBUG] UDP sendBatchViaUdp: Sending %d records, %d bytes via UDP to %s:%d%n", 
+                recordCount, data.readableBytes(), route.forward.host, route.forward.port);
+            
+            // Create UDP channel for sending
             Bootstrap b = new Bootstrap()
                     .group(ctx.channel().eventLoop())
-                    .channel(NioSocketChannel.class)
-                    .handler(new ChannelInitializer<SocketChannel>() {
-                        @Override protected void initChannel(SocketChannel ch) {
-                            if (useTls()) ch.pipeline().addLast(
-                                    sslCtx.newHandler(ch.alloc(),
-                                            route.forward.host, route.forward.port));
-                        }
-                        private boolean useTls() {
-                            return route.forward.tls == null || route.forward.tls;
-                        }
-                    });
-            final int recordCount = records.size();
+                    .channel(NioDatagramChannel.class);
+            
             b.connect(route.forward.host, route.forward.port).addListener((ChannelFuture f) -> {
                 if (f.isSuccess()) {
-                    f.channel().writeAndFlush(data).addListener(future -> {
+                    DatagramPacket packet = new DatagramPacket(data, 
+                        new InetSocketAddress(route.forward.host, route.forward.port));
+                    
+                    f.channel().writeAndFlush(packet).addListener(future -> {
                         if (!future.isSuccess()) {
+                            System.err.printf("[DEBUG] UDP sendBatchViaUdp: Send failed - %s%n", future.cause().getMessage());
                             if (recordCount > 1) {
                                 int mid = recordCount / 2;
                                 java.util.List<DatagramPacket> left = records.subList(0, mid);
@@ -801,10 +994,13 @@ public class JumpServer {
                                 records.get(0).content().release();
                             }
                         } else {
+                            System.err.printf("[DEBUG] UDP sendBatchViaUdp: Successfully sent %d records via UDP%n", recordCount);
                             for (DatagramPacket pkt : records) pkt.content().release();
                         }
+                        f.channel().close();
                     });
                 } else {
+                    System.err.printf("[DEBUG] UDP sendBatchViaUdp: Connection failed - %s%n", f.cause().getMessage());
                     data.release();
                     for (DatagramPacket pkt : records) pkt.content().release();
                 }
