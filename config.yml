@@ -10,7 +10,7 @@ batch_config:
   max_batch_bytes: 1048576    # Maximum bytes per batch (1MB)
   flush_interval_ms: 1000     # Flush interval in milliseconds
   enable_compression: true    # Enable Snappy compression
-  enable_batching: false       # Enable batching (default true)
+  enable_batching: false       # Enable batching
   
   # Retry configuration
   max_connection_retries: 120  # Maximum connection retry attempts (0 = infinite)

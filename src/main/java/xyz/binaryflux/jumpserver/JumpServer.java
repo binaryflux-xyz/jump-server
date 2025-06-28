@@ -74,7 +74,7 @@ public class JumpServer {
         public boolean enable_batching = true;    // Enable batching (default true)
         
         // Retry configuration
-        // public int max_connection_retries = 120;  // Maximum connection retry attempts (0 = infinite)
+        public int max_connection_retries = 120;  // Maximum connection retry attempts (0 = infinite)
         public long connection_retry_delay_ms = 2000; // Delay between connection retries
         public int max_send_retries = 3;         // Maximum send retry attempts
         public long send_retry_delay_ms = 1000;  // Delay between send retries
@@ -211,7 +211,21 @@ public class JumpServer {
             ByteBuf msg;
             while ((msg = pendingMessages.poll()) != null) {
                 if (outbound != null && outbound.isActive()) {
-                    outbound.pipeline().get(BatchedForwarder.class).addToBatch(msg);
+                    if (!batchConfig.enable_batching) {
+                        // Send immediately when batching is disabled
+                        final ByteBuf finalMsg = msg;
+                        outbound.writeAndFlush(msg.retain()).addListener((ChannelFuture future) -> {
+                            if (!future.isSuccess()) {
+                                System.err.printf("[DEBUG] Failed to send pending message: %s%n", future.cause().getMessage());
+                            } else {
+                                System.err.printf("[DEBUG] Successfully sent pending message%n");
+                            }
+                            finalMsg.release();
+                        });
+                    } else {
+                        // Add to batch when batching is enabled
+                        outbound.pipeline().get(BatchedForwarder.class).addToBatch(msg);
+                    }
                 } else {
                     // Put it back in the queue if connection is lost
                     pendingMessages.offer(msg);
