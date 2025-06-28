@@ -9,7 +9,15 @@ batch_config:
   max_batch_size: 1000        # Maximum number of records per batch
   max_batch_bytes: 1048576    # Maximum bytes per batch (1MB)
   flush_interval_ms: 1000     # Flush interval in milliseconds
-  enable_compression: true    # Enable GZIP compression
+  enable_compression: true    # Enable Snappy compression
+  enable_batching: false       # Enable batching (default true)
+  
+  # Retry configuration
+  max_connection_retries: 120  # Maximum connection retry attempts (0 = infinite)
+  connection_retry_delay_ms: 2000  # Delay between connection retries
+  max_send_retries: 3         # Maximum send retry attempts
+  send_retry_delay_ms: 1000   # Delay between send retries
+  persistent_reconnection: true  # Keep trying to reconnect after disconnection
   
 routes:
   - name: windows
