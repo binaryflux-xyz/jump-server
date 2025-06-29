@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN" monitorInterval="30">
+    <Properties>
+        <Property name="LOG_PATTERN">%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n</Property>
+        <Property name="LOG_FILE_PATH">logs</Property>
+    </Properties>
+    
+    <Appenders>
+        <!-- Console Appender -->
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+        </Console>
+        
+        <!-- File Appender for all logs -->
+        <RollingFile name="FileAppender" fileName="${LOG_FILE_PATH}/jump-server.log"
+                     filePattern="${LOG_FILE_PATH}/jump-server-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <SizeBasedTriggeringPolicy size="100MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30"/>
+        </RollingFile>
+        
+        <!-- Error File Appender -->
+        <RollingFile name="ErrorFileAppender" fileName="${LOG_FILE_PATH}/jump-server-error.log"
+                     filePattern="${LOG_FILE_PATH}/jump-server-error-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <SizeBasedTriggeringPolicy size="100MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30"/>
+        </RollingFile>
+        
+        <!-- Async Appender for better performance -->
+        <Async name="AsyncFileAppender">
+            <AppenderRef ref="FileAppender"/>
+        </Async>
+        
+        <Async name="AsyncErrorAppender">
+            <AppenderRef ref="ErrorFileAppender"/>
+        </Async>
+    </Appenders>
+    
+    <Loggers>
+        <!-- Root Logger -->
+        <Root level="INFO">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="AsyncFileAppender"/>
+        </Root>
+        
+        <!-- Application Logger -->
+        <Logger name="xyz.binaryflux.jumpserver" level="INFO" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="AsyncFileAppender"/>
+        </Logger>
+        
+        <!-- Error Logger -->
+        <Logger name="xyz.binaryflux.jumpserver.error" level="ERROR" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="AsyncErrorAppender"/>
+        </Logger>
+        
+        <!-- Netty Logger - Reduce noise -->
+        <Logger name="io.netty" level="WARN" additivity="false">
+            <AppenderRef ref="AsyncFileAppender"/>
+        </Logger>
+        
+        <!-- Third-party libraries -->
+        <Logger name="org.apache" level="WARN" additivity="false">
+            <AppenderRef ref="AsyncFileAppender"/>
+        </Logger>
+    </Loggers>
+</Configuration> 
