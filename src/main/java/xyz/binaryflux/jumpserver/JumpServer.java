@@ -11,6 +11,9 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.*;
 import io.netty.channel.socket.nio.*;
 import io.netty.handler.ssl.*;
+import io.netty.channel.socket.DatagramPacket;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.TrustManagerFactory;
@@ -25,6 +28,8 @@ import java.util.concurrent.ScheduledFuture;
 import org.xerial.snappy.Snappy;
 
 public class JumpServer {
+
+    private static final Logger logger = LogManager.getLogger(JumpServer.class);
 
     /* ---------- Config POJOs ---------- */
 
@@ -100,7 +105,7 @@ public class JumpServer {
             } else if ("udp".equalsIgnoreCase(r.listen.protocol)) {
                 startUdpRoute(r, sslCtx, workerGroup, cfg.batch_config);
             } else {
-                System.err.printf("[%s] Unknown protocol %s%n", r.name, r.listen.protocol);
+                logger.error("[{}] Unknown protocol {}", r.name, r.listen.protocol);
             }
         }
 
@@ -151,12 +156,12 @@ public class JumpServer {
         
         private void connect(ChannelHandlerContext ctx) {
             if (isReconnecting) {
-                System.err.printf("[DEBUG] Already attempting to reconnect, skipping%n");
+                logger.debug("Already attempting to reconnect, skipping");
                 return;
             }
             
             isReconnecting = true;
-            System.err.printf("[DEBUG] Attempting to connect to %s:%d%n", route.forward.host, route.forward.port);
+            logger.debug("Attempting to connect to {}:{}", route.forward.host, route.forward.port);
             
             Bootstrap b = new Bootstrap()
                     .group(ctx.channel().eventLoop())
@@ -171,7 +176,7 @@ public class JumpServer {
 
             b.connect(route.forward.host, route.forward.port).addListener((ChannelFuture f) -> {
                 if (f.isSuccess()) {
-                    System.err.printf("[DEBUG] Successfully connected to backend%n");
+                    logger.debug("Successfully connected to backend");
                     isReconnecting = false;
                     outbound = f.channel();
                     
@@ -180,7 +185,7 @@ public class JumpServer {
                     
                     // Add connection close listener
                     outbound.closeFuture().addListener((ChannelFuture closeFuture) -> {
-                        System.err.printf("[DEBUG] Backend connection closed%n");
+                        logger.debug("Backend connection closed");
                         outbound = null;
                         
                         // Clean up any remaining pending messages
@@ -193,7 +198,7 @@ public class JumpServer {
                     
                     ctx.channel().read();
                 } else {
-                    System.err.printf("[DEBUG] Connection failed: %s%n", f.cause().getMessage());
+                    logger.error("Connection failed: {}", f.cause().getMessage());
                     isReconnecting = false;
                     
                     // Clean up pending messages on connection failure
@@ -213,7 +218,7 @@ public class JumpServer {
                 return;
             }
             
-            System.err.printf("[DEBUG] Processing %d pending messages%n", pendingMessages.size());
+            logger.debug("Processing {} pending messages", pendingMessages.size());
             
             ByteBuf msg;
             while ((msg = pendingMessages.poll()) != null) {
@@ -223,9 +228,9 @@ public class JumpServer {
                         final ByteBuf finalMsg = msg;
                         outbound.writeAndFlush(msg.retain()).addListener((ChannelFuture future) -> {
                             if (!future.isSuccess()) {
-                                System.err.printf("[DEBUG] Failed to send pending message: %s%n", future.cause().getMessage());
+                                logger.error("Failed to send pending message: {}", future.cause().getMessage());
                             } else {
-                                System.err.printf("[DEBUG] Successfully sent pending message%n");
+                                logger.debug("Successfully sent pending message");
                             }
                             finalMsg.release();
                         });
@@ -243,12 +248,12 @@ public class JumpServer {
             // Cancel cleanup task if all messages were processed
             if (pendingMessages.isEmpty() && cleanupTask != null && !cleanupTask.isDone()) {
                 cleanupTask.cancel(false);
-                System.err.printf("[DEBUG] Cancelled cleanup task - all messages processed%n");
+                logger.debug("Cancelled cleanup task - all messages processed");
             }
         }
         
         private void cleanupPendingMessages() {
-            System.err.printf("[DEBUG] Cleaning up %d pending messages%n", pendingMessages.size());
+            logger.debug("Cleaning up {} pending messages", pendingMessages.size());
             ByteBuf msg;
             while ((msg = pendingMessages.poll()) != null) {
                 msg.release();
@@ -260,7 +265,7 @@ public class JumpServer {
                 return; // Already scheduled
             }
             
-            System.err.printf("[DEBUG] Scheduling reconnection in %d ms%n", batchConfig.connection_retry_delay_ms);
+            logger.debug("Scheduling reconnection in {} ms", batchConfig.connection_retry_delay_ms);
             reconnectTask = clientCtx.executor().schedule(
                 () -> connect(clientCtx),
                 batchConfig.connection_retry_delay_ms,
@@ -269,12 +274,12 @@ public class JumpServer {
         }
 
         @Override public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            System.out.println("[DEBUG] Msg received: " + msg);
+            logger.debug("Msg received: {}", msg);
             if (outbound != null && outbound.isActive()) {
                 // Pass the message to the batched forwarder
                 outbound.pipeline().get(BatchedForwarder.class).addToBatch(msg);
             } else {
-                System.err.printf("[DEBUG] Backend not connected, queuing message for retry%n");
+                logger.error("Backend not connected, queuing message for retry");
                 // Queue message for retry when connection is restored
                 if (msg instanceof ByteBuf) {
                     pendingMessages.offer(((ByteBuf) msg).retain());
@@ -291,7 +296,7 @@ public class JumpServer {
         }
 
         @Override public void channelInactive(ChannelHandlerContext ctx) {
-            System.out.println("[DEBUG] Client disconnected: " + ctx.channel().remoteAddress());
+            logger.info("Client disconnected: {}", ctx.channel().remoteAddress());
             if (reconnectTask != null) {
                 reconnectTask.cancel(false);
             }
@@ -313,7 +318,7 @@ public class JumpServer {
     }
 
     private static final class BatchedForwarder extends ChannelInboundHandlerAdapter {
-        private final Channel inbound;
+        private final Channel clientChannel;  // Channel to client (for responses)
         private final BatchConfig batchConfig;
         private final ConcurrentLinkedQueue<ByteBuf> batchQueue = new ConcurrentLinkedQueue<>();
         private final ConcurrentLinkedQueue<ByteBuf> retryQueue = new ConcurrentLinkedQueue<>();
@@ -321,9 +326,10 @@ public class JumpServer {
         private int currentBatchBytes = 0;
         private ScheduledFuture<?> flushTask;
         private ScheduledFuture<?> retryTask;
+        private ChannelHandlerContext backendCtx;  // Context for backend connection
 
-        BatchedForwarder(Channel inbound, BatchConfig batchConfig) {
-            this.inbound = inbound;
+        BatchedForwarder(Channel clientChannel, BatchConfig batchConfig) {
+            this.clientChannel = clientChannel;
             this.batchConfig = batchConfig;
             if (batchConfig.enable_batching) {
                 scheduleFlush();
@@ -331,16 +337,20 @@ public class JumpServer {
             scheduleRetryTask();
         }
 
+        @Override public void channelActive(ChannelHandlerContext ctx) {
+            this.backendCtx = ctx;
+        }
+
         @Override public void channelRead(ChannelHandlerContext ctx, Object msg) {
             if (!batchConfig.enable_batching) {
                 // Send immediately, no compression
                 if (msg instanceof ByteBuf) {
-                    inbound.writeAndFlush(msg);
+                    clientChannel.writeAndFlush(msg);
                 }
                 return;
             }
-            // Forward response data back to the inbound channel
-            inbound.writeAndFlush(msg);
+            // Forward response data back to the client channel
+            clientChannel.writeAndFlush(msg);
         }
 
         @Override public void channelInactive(ChannelHandlerContext ctx) {
@@ -351,20 +361,20 @@ public class JumpServer {
                 retryTask.cancel(false);
             }
             flushBatch(); // Final flush
-            inbound.close();
+            clientChannel.close();
         }
 
         public void queueForRetry(Object msg) {
             if (msg instanceof ByteBuf) {
                 ByteBuf buf = (ByteBuf) msg;
-                System.err.printf("[DEBUG] queueForRetry: Queuing %d bytes for retry%n", buf.readableBytes());
+                logger.debug("queueForRetry: Queuing {} bytes for retry", buf.readableBytes());
                 retryQueue.offer(buf.retain());
             }
         }
 
         private void scheduleRetryTask() {
             if (batchConfig.send_retry_delay_ms > 0) {
-                retryTask = inbound.eventLoop().scheduleAtFixedRate(
+                retryTask = clientChannel.eventLoop().scheduleAtFixedRate(
                     this::processRetryQueue,
                     batchConfig.send_retry_delay_ms,
                     batchConfig.send_retry_delay_ms,
@@ -378,7 +388,7 @@ public class JumpServer {
                 return;
             }
             
-            System.err.printf("[DEBUG] processRetryQueue: Processing %d retry items%n", retryQueue.size());
+            logger.debug("processRetryQueue: Processing {} retry items", retryQueue.size());
             
             ByteBuf msg;
             while ((msg = retryQueue.poll()) != null) {
@@ -391,12 +401,12 @@ public class JumpServer {
                 ByteBuf buf = (ByteBuf) msg;
                 int msgSize = buf.readableBytes();
                 
-                System.err.printf("[DEBUG] addToBatch: Received message of %d bytes, current batch: %d records, %d bytes%n", 
+                logger.debug("addToBatch: Received message of {} bytes, current batch: {} records, {} bytes", 
                     msgSize, currentBatchSize, currentBatchBytes);
                 
                 if (!batchConfig.enable_batching) {
                     // Send immediately when batching is disabled with retry logic
-                    System.err.printf("[DEBUG] addToBatch: Batching disabled, sending immediately%n");
+                    logger.debug("addToBatch: Batching disabled, sending immediately");
                     sendWithRetry(buf, 0);
                     return;
                 }
@@ -404,7 +414,7 @@ public class JumpServer {
                 // Check if adding this message would exceed batch limits
                 if (currentBatchSize >= batchConfig.max_batch_size || 
                     currentBatchBytes + msgSize >= batchConfig.max_batch_bytes) {
-                    System.err.printf("[DEBUG] addToBatch: Batch limits reached, flushing batch%n");
+                    logger.debug("addToBatch: Batch limits reached, flushing batch");
                     flushBatch();
                 }
                 
@@ -413,43 +423,50 @@ public class JumpServer {
                 currentBatchSize++;
                 currentBatchBytes += msgSize;
                 
-                System.err.printf("[DEBUG] addToBatch: Added to batch, new size: %d records, %d bytes%n", 
+                logger.debug("addToBatch: Added to batch, new size: {} records, {} bytes", 
                     currentBatchSize, currentBatchBytes);
             }
         }
 
         private void sendWithRetry(ByteBuf buf, int attempt) {
-            System.err.printf("[DEBUG] sendWithRetry: Attempting to send %d bytes to backend (attempt %d)%n", 
+            logger.debug("sendWithRetry: Attempting to send {} bytes to backend (attempt {})", 
                 buf.readableBytes(), attempt + 1);
             
-            inbound.writeAndFlush(buf.retain()).addListener((ChannelFuture future) -> {
-                if (!future.isSuccess()) {
-                    System.err.printf("[DEBUG] sendWithRetry: Send failed (attempt %d) - %s%n", 
-                        attempt + 1, future.cause().getMessage());
-                    
-                    if (attempt < batchConfig.max_send_retries) {
-                        System.err.printf("[DEBUG] sendWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
-                        inbound.eventLoop().schedule(
-                            () -> sendWithRetry(buf, attempt + 1),
-                            batchConfig.send_retry_delay_ms,
-                            TimeUnit.MILLISECONDS
-                        );
+            // Use the backend context for sending
+            if (backendCtx != null && backendCtx.channel().isActive()) {
+                backendCtx.writeAndFlush(buf.retain()).addListener((ChannelFuture future) -> {
+                    if (!future.isSuccess()) {
+                        logger.error("sendWithRetry: Send failed (attempt {}) - {}", 
+                            attempt + 1, future.cause().getMessage());
+                        
+                        if (attempt < batchConfig.max_send_retries) {
+                            logger.debug("sendWithRetry: Retrying in {} ms", batchConfig.send_retry_delay_ms);
+                            clientChannel.eventLoop().schedule(
+                                () -> sendWithRetry(buf, attempt + 1),
+                                batchConfig.send_retry_delay_ms,
+                                TimeUnit.MILLISECONDS
+                            );
+                        } else {
+                            logger.debug("sendWithRetry: Max retries reached, queuing for later retry");
+                            retryQueue.offer(buf.retain());
+                            buf.release();
+                        }
                     } else {
-                        System.err.printf("[DEBUG] sendWithRetry: Max retries reached, queuing for later retry%n");
-                        retryQueue.offer(buf.retain());
+                        logger.debug("sendWithRetry: Successfully sent {} bytes to backend (attempt {})", 
+                            buf.readableBytes(), attempt + 1);
                         buf.release();
                     }
-                } else {
-                    System.err.printf("[DEBUG] sendWithRetry: Successfully sent %d bytes to backend (attempt %d)%n", 
-                        buf.readableBytes(), attempt + 1);
-                    buf.release();
-                }
-            });
+                });
+            } else {
+                logger.debug("sendWithRetry: Backend channel not active, queuing for retry");
+                retryQueue.offer(buf.retain());
+                buf.release();
+            }
         }
 
         private void scheduleFlush() {
             if (batchConfig.enable_batching && batchConfig.flush_interval_ms > 0) {
-                flushTask = inbound.eventLoop().scheduleAtFixedRate(
+                flushTask = clientChannel.eventLoop().scheduleAtFixedRate(
                     this::flushBatch,
                     batchConfig.flush_interval_ms,
                     batchConfig.flush_interval_ms,
@@ -460,11 +477,11 @@ public class JumpServer {
 
         private void flushBatch() {
             if (batchQueue.isEmpty()) {
-                System.err.printf("[DEBUG] flushBatch: Queue is empty, nothing to flush%n");
+                logger.debug("flushBatch: Queue is empty, nothing to flush");
                 return;
             }
             
-            System.err.printf("[DEBUG] flushBatch: Starting flush of %d records, %d bytes%n", 
+            logger.debug("flushBatch: Starting flush of {} records, {} bytes", 
                 currentBatchSize, currentBatchBytes);
             
             try {
@@ -475,89 +492,118 @@ public class JumpServer {
                     records.add(msg);
                 }
                 
-                System.err.printf("[DEBUG] flushBatch: Gathered %d records for sending%n", records.size());
+                logger.debug("flushBatch: Gathered {} records for sending", records.size());
                 sendBatchWithSplit(records);
                 
                 // Reset batch counters
                 currentBatchSize = 0;
                 currentBatchBytes = 0;
-                System.err.printf("[DEBUG] flushBatch: Reset batch counters%n");
+                logger.debug("flushBatch: Reset batch counters");
             } catch (Exception e) {
-                System.err.printf("[DEBUG] flushBatch: Exception during flush: %s%n", e.getMessage());
-                System.err.printf("Error flushing batch: %s%n", e.getMessage());
+                logger.error("flushBatch: Exception during flush: {}", e.getMessage());
+                logger.error("Error flushing batch: {}", e.getMessage());
             }
         }
 
         private void sendBatchWithSplit(java.util.List<ByteBuf> records) {
             if (records.isEmpty()) return;
             
-            System.err.printf("[DEBUG] sendBatchWithSplit: Starting with %d records%n", records.size());
+            logger.debug("sendBatchWithSplit: Starting with {} records", records.size());
             
-            ByteBufAllocator alloc = inbound.alloc();
+            ByteBufAllocator alloc = clientChannel.alloc();
             ByteBuf batchData = alloc.buffer();
             try {
                 // Log total size of records
                 long totalSize = records.stream().mapToLong(ByteBuf::readableBytes).sum();
-                System.err.printf("[DEBUG] sendBatchWithSplit: Total records size: %d bytes%n", totalSize);
+                logger.debug("sendBatchWithSplit: Total records size: {} bytes", totalSize);
                 
                 for (ByteBuf buf : records) {
                     batchData.writeBytes(buf, buf.readerIndex(), buf.readableBytes());
                 }
                 
-                System.err.printf("[DEBUG] sendBatchWithSplit: Combined batch size: %d bytes%n", batchData.readableBytes());
+                logger.debug("sendBatchWithSplit: Combined batch size: {} bytes", batchData.readableBytes());
                 
                 ByteBuf compressedData = batchData;
                 if (batchConfig.enable_compression && batchData.readableBytes() > 0) {
-                    System.err.printf("[DEBUG] sendBatchWithSplit: Compressing data...%n");
+                    logger.debug("sendBatchWithSplit: Compressing data...");
                     compressedData = compressData(batchData, alloc);
                     batchData.release();
-                    System.err.printf("[DEBUG] sendBatchWithSplit: Compressed size: %d bytes (compression ratio: %.2f%%)%n", 
+                    logger.debug("sendBatchWithSplit: Compressed size: {} bytes (compression ratio: {:.2f}%)", 
                         compressedData.readableBytes(), 
                         (100.0 * compressedData.readableBytes() / totalSize));
                 } else {
-                    System.err.printf("[DEBUG] sendBatchWithSplit: Compression disabled or empty data%n");
+                    logger.debug("sendBatchWithSplit: Compression disabled or empty data");
                 }
                 
                 final int recordCount = records.size();
                 final ByteBuf finalCompressedData = compressedData;
-                System.err.printf("[DEBUG] sendBatchWithSplit: Sending %d records, %d bytes%n", 
-                    recordCount, finalCompressedData.readableBytes());
+                final int bytesToSend = finalCompressedData.readableBytes();
                 
-                inbound.writeAndFlush(finalCompressedData).addListener((ChannelFuture future) -> {
-                    if (!future.isSuccess()) {
-                        Throwable cause = future.cause();
-                        System.err.printf("[DEBUG] sendBatchWithSplit: Send failed - %s%n", cause.getMessage());
-                        
-                        boolean isClosed = cause instanceof java.nio.channels.ClosedChannelException ||
-                                           (cause != null && cause.getClass().getSimpleName().contains("ClosedChannelException"));
-                        
-                        if (recordCount > 1 && !isClosed) {
-                            System.err.printf("[DEBUG] sendBatchWithSplit: Splitting batch of %d records and retrying%n", recordCount);
-                            int mid = recordCount / 2;
-                            java.util.List<ByteBuf> left = records.subList(0, mid);
-                            java.util.List<ByteBuf> right = records.subList(mid, recordCount);
-                            sendBatchWithSplit(new java.util.ArrayList<>(left));
-                            sendBatchWithSplit(new java.util.ArrayList<>(right));
-                        } else {
-                            if (isClosed) {
-                                System.err.printf("[DEBUG] sendBatchWithSplit: Channel closed, writing %d records to retry file%n", recordCount);
-                                RetryFileUtil.writeFailedBatch(records, batchConfig.enable_compression);
+                logger.debug("sendBatchWithSplit: Sending {} records, {} bytes", 
+                    recordCount, bytesToSend);
+                
+                // Debug: Show first few bytes of data being sent
+                if (bytesToSend > 0) {
+                    byte[] debugBytes = new byte[Math.min(32, bytesToSend)];
+                    finalCompressedData.getBytes(finalCompressedData.readerIndex(), debugBytes);
+                    StringBuilder hex = new StringBuilder();
+                    for (byte b : debugBytes) {
+                        hex.append(String.format("%02x ", b));
+                    }
+                    logger.debug("sendBatchWithSplit: First {} bytes (hex): {}", debugBytes.length, hex.toString());
+                }
+                
+                // Use the backend context for sending
+                if (backendCtx != null && backendCtx.channel().isActive()) {
+                    logger.debug("sendBatchWithSplit: Backend channel is active, sending data");
+                    backendCtx.writeAndFlush(finalCompressedData).addListener((ChannelFuture future) -> {
+                        if (!future.isSuccess()) {
+                            Throwable cause = future.cause();
+                            logger.error("sendBatchWithSplit: Send failed - {}", cause.getMessage());
+                            
+                            boolean isClosed = cause instanceof java.nio.channels.ClosedChannelException ||
+                                               (cause != null && cause.getClass().getSimpleName().contains("ClosedChannelException"));
+                            
+                            if (recordCount > 1 && !isClosed) {
+                                logger.debug("sendBatchWithSplit: Splitting batch of {} records and retrying", recordCount);
+                                int mid = recordCount / 2;
+                                java.util.List<ByteBuf> left = records.subList(0, mid);
+                                java.util.List<ByteBuf> right = records.subList(mid, recordCount);
+                                sendBatchWithSplit(new java.util.ArrayList<>(left));
+                                sendBatchWithSplit(new java.util.ArrayList<>(right));
                             } else {
-                                System.err.printf("[DEBUG] sendBatchWithSplit: Single record failed, logging error%n");
+                                if (isClosed) {
+                                    logger.debug("sendBatchWithSplit: Channel closed, writing {} records to retry file", recordCount);
+                                    RetryFileUtil.writeFailedBatch(records, batchConfig.enable_compression);
+                                } else {
+                                    logger.debug("sendBatchWithSplit: Single record failed, logging error");
+                                }
+                                for (ByteBuf buf : records) buf.release();
                             }
+                        } else {
+                            logger.debug("sendBatchWithSplit: Successfully sent {} records, {} bytes to backend", 
+                                recordCount, bytesToSend);
+                            logger.debug("sendBatchWithSplit: Backend channel writable: {}, active: {}", 
+                                backendCtx.channel().isWritable(), backendCtx.channel().isActive());
                             for (ByteBuf buf : records) buf.release();
                         }
+                    });
+                } else {
+                    logger.debug("sendBatchWithSplit: Backend channel not active, writing to retry file");
+                    if (backendCtx == null) {
+                        logger.debug("sendBatchWithSplit: Backend context is null");
                     } else {
-                        System.err.printf("[DEBUG] sendBatchWithSplit: Successfully sent %d records, %d bytes%n", 
-                            recordCount, finalCompressedData.readableBytes());
-                        for (ByteBuf buf : records) buf.release();
+                        logger.debug("sendBatchWithSplit: Backend channel active: {}, writable: {}", 
+                            backendCtx.channel().isActive(), backendCtx.channel().isWritable());
                     }
-                });
+                    RetryFileUtil.writeFailedBatch(records, batchConfig.enable_compression);
+                    for (ByteBuf buf : records) buf.release();
+                }
             } catch (Throwable t) {
-                System.err.printf("[DEBUG] sendBatchWithSplit: Exception during processing: %s%n", t.getMessage());
+                logger.error("sendBatchWithSplit: Exception during processing: {}", t.getMessage());
                 batchData.release();
                 for (ByteBuf buf : records) buf.release();
-                System.err.printf("Error in sendBatchWithSplit: %s%n", t.getMessage());
+                logger.error("Error in sendBatchWithSplit: {}", t.getMessage());
             }
         }
 
@@ -566,12 +612,48 @@ public class JumpServer {
                 return data.retain(); // Return uncompressed data
             }
             
+            logger.debug("compressData: Starting compression of {} bytes", data.readableBytes());
+            
+            // Log first few bytes of input data
+            if (data.readableBytes() > 0) {
+                byte[] debugInput = new byte[Math.min(32, data.readableBytes())];
+                data.getBytes(data.readerIndex(), debugInput);
+                StringBuilder hexInput = new StringBuilder();
+                for (byte b : debugInput) {
+                    hexInput.append(String.format("%02x ", b));
+                }
+                logger.debug("compressData: Input data first {} bytes (hex): {}", debugInput.length, hexInput.toString());
+                
+                // Also show as string if possible
+                String inputString = new String(debugInput, java.nio.charset.StandardCharsets.UTF_8);
+                logger.debug("compressData: Input data first {} bytes (string): {}", debugInput.length, inputString);
+            }
+            
             // Snappy compression
             byte[] input = new byte[data.readableBytes()];
             data.getBytes(data.readerIndex(), input);
+            
+            logger.debug("compressData: Calling Snappy.compress() with {} bytes", input.length);
             byte[] compressed = Snappy.compress(input);
+            logger.debug("compressData: Snappy.compress() returned {} bytes", compressed.length);
+            
+            // Log first few bytes of compressed data
+            if (compressed.length > 0) {
+                byte[] debugCompressed = new byte[Math.min(32, compressed.length)];
+                System.arraycopy(compressed, 0, debugCompressed, 0, debugCompressed.length);
+                StringBuilder hexCompressed = new StringBuilder();
+                for (byte b : debugCompressed) {
+                    hexCompressed.append(String.format("%02x ", b));
+                }
+                logger.debug("compressData: Compressed data first {} bytes (hex): {}", debugCompressed.length, hexCompressed.toString());
+            }
+            
             ByteBuf result = alloc.buffer(compressed.length);
             result.writeBytes(compressed);
+            
+            logger.debug("compressData: Created ByteBuf with {} bytes, compression ratio: {:.2f}%", 
+                result.readableBytes(), (100.0 * result.readableBytes() / data.readableBytes()));
+            
             return result;
         }
     }
@@ -624,13 +706,13 @@ public class JumpServer {
             
             // Check if we should use UDP forwarding
             if ("udp".equalsIgnoreCase(route.forward.protocol)) {
-                System.err.printf("[DEBUG] UDP: Using UDP forwarding to %s:%d%n", 
+                logger.debug("UDP: Using UDP forwarding to {}:{}", 
                     route.forward.host, route.forward.port);
                 return; // No TCP connection needed for UDP forwarding
             }
             
             isConnecting = true;
-            System.err.printf("[DEBUG] UDP: Establishing persistent TCP connection to %s:%d%n", 
+            logger.debug("UDP: Establishing persistent TCP connection to {}:{}", 
                 route.forward.host, route.forward.port);
             
             Bootstrap b = new Bootstrap()
@@ -651,11 +733,11 @@ public class JumpServer {
                 isConnecting = false;
                 if (f.isSuccess()) {
                     tcpConnection = f.channel();
-                    System.err.printf("[DEBUG] UDP: Persistent TCP connection established%n");
+                    logger.debug("UDP: Persistent TCP connection established");
                     
                     // Add connection close listener
                     tcpConnection.closeFuture().addListener((ChannelFuture closeFuture) -> {
-                        System.err.printf("[DEBUG] UDP: TCP connection closed, will reconnect%n");
+                        logger.debug("UDP: TCP connection closed, will reconnect");
                         tcpConnection = null;
                         // Reconnect after a delay
                         ctx.executor().schedule(
@@ -668,7 +750,7 @@ public class JumpServer {
                     // Process any pending retry messages
                     processRetryQueue();
                 } else {
-                    System.err.printf("[DEBUG] UDP: TCP connection failed: %s%n", f.cause().getMessage());
+                    logger.error("UDP: TCP connection failed: {}", f.cause().getMessage());
                     // Retry connection after delay
                     ctx.executor().schedule(
                         () -> establishTcpConnection(),
@@ -708,30 +790,30 @@ public class JumpServer {
                 // Use existing persistent connection
                 tcpConnection.writeAndFlush(data.retain()).addListener((ChannelFuture writeFuture) -> {
                     if (!writeFuture.isSuccess()) {
-                        System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Send failed (attempt %d) - %s%n", 
+                        logger.error("UDP sendSingleViaTcpWithRetry: Send failed (attempt {}) - {}", 
                             attempt + 1, writeFuture.cause().getMessage());
                         
                         if (attempt < batchConfig.max_send_retries) {
-                            System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
+                            logger.debug("UDP sendSingleViaTcpWithRetry: Retrying in {} ms", batchConfig.send_retry_delay_ms);
                             ctx.executor().schedule(
                                 () -> sendSingleViaTcpWithRetry(ctx, data, attempt + 1),
                                 batchConfig.send_retry_delay_ms,
                                 TimeUnit.MILLISECONDS
                             );
                         } else {
-                            System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Max retries reached, queuing for later retry%n");
+                            logger.debug("UDP sendSingleViaTcpWithRetry: Max retries reached, queuing for later retry");
                             retryQueue.offer(new DatagramPacket(data.retain(), null));
                             data.release();
                         }
                     } else {
-                        System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: Successfully sent %d bytes via persistent connection (attempt %d)%n", 
+                        logger.debug("UDP sendSingleViaTcpWithRetry: Successfully sent {} bytes via persistent connection (attempt {})", 
                             data.readableBytes(), attempt + 1);
                         data.release();
                     }
                 });
             } else {
                 // No persistent connection available, queue for retry
-                System.err.printf("[DEBUG] UDP sendSingleViaTcpWithRetry: No persistent connection, queuing message%n");
+                logger.debug("UDP sendSingleViaTcpWithRetry: No persistent connection, queuing message");
                 retryQueue.offer(new DatagramPacket(data.retain(), null));
                 data.release();
                 
@@ -743,7 +825,7 @@ public class JumpServer {
         }
 
         private void sendSingleViaUdpWithRetry(ChannelHandlerContext ctx, ByteBuf data, int attempt) {
-            System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Sending %d bytes via UDP to %s:%d (attempt %d)%n", 
+            logger.debug("UDP sendSingleViaUdpWithRetry: Sending {} bytes via UDP to {}:{} (attempt {})", 
                 data.readableBytes(), route.forward.host, route.forward.port, attempt + 1);
             
             // Create UDP channel for sending
@@ -758,41 +840,41 @@ public class JumpServer {
                     
                     f.channel().writeAndFlush(packet).addListener((ChannelFuture writeFuture) -> {
                         if (!writeFuture.isSuccess()) {
-                            System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Send failed (attempt %d) - %s%n", 
+                            logger.error("UDP sendSingleViaUdpWithRetry: Send failed (attempt {}) - {}", 
                                 attempt + 1, writeFuture.cause().getMessage());
                             
                             if (attempt < batchConfig.max_send_retries) {
-                                System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
+                                logger.debug("UDP sendSingleViaUdpWithRetry: Retrying in {} ms", batchConfig.send_retry_delay_ms);
                                 ctx.executor().schedule(
                                     () -> sendSingleViaUdpWithRetry(ctx, data, attempt + 1),
                                     batchConfig.send_retry_delay_ms,
                                     TimeUnit.MILLISECONDS
                                 );
                             } else {
-                                System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Max retries reached, queuing for later retry%n");
+                                logger.debug("UDP sendSingleViaUdpWithRetry: Max retries reached, queuing for later retry");
                                 retryQueue.offer(new DatagramPacket(data.retain(), null));
                                 data.release();
                             }
                         } else {
-                            System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Successfully sent %d bytes via UDP (attempt %d)%n", 
+                            logger.debug("UDP sendSingleViaUdpWithRetry: Successfully sent {} bytes via UDP (attempt {})", 
                                 data.readableBytes(), attempt + 1);
                             data.release();
                         }
                         f.channel().close();
                     });
                 } else {
-                    System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Connection failed (attempt %d) - %s%n", 
+                    logger.error("UDP sendSingleViaUdpWithRetry: Connection failed (attempt {}) - {}", 
                         attempt + 1, f.cause().getMessage());
                     
                     if (attempt < batchConfig.max_send_retries) {
-                        System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Retrying in %d ms%n", batchConfig.send_retry_delay_ms);
+                        logger.debug("UDP sendSingleViaUdpWithRetry: Retrying in {} ms", batchConfig.send_retry_delay_ms);
                         ctx.executor().schedule(
                             () -> sendSingleViaUdpWithRetry(ctx, data, attempt + 1),
                             batchConfig.send_retry_delay_ms,
                             TimeUnit.MILLISECONDS
                         );
                     } else {
-                        System.err.printf("[DEBUG] UDP sendSingleViaUdpWithRetry: Max retries reached, queuing for later retry%n");
+                        logger.debug("UDP sendSingleViaUdpWithRetry: Max retries reached, queuing for later retry");
                         retryQueue.offer(new DatagramPacket(data.retain(), null));
                         data.release();
                     }
@@ -816,7 +898,7 @@ public class JumpServer {
                 return;
             }
             
-            System.err.printf("[DEBUG] UDP processRetryQueue: Processing %d retry items%n", retryQueue.size());
+            logger.debug("UDP processRetryQueue: Processing {} retry items", retryQueue.size());
             
             DatagramPacket pkt;
             while ((pkt = retryQueue.poll()) != null) {
@@ -842,7 +924,7 @@ public class JumpServer {
             
             // Close persistent TCP connection
             if (tcpConnection != null && tcpConnection.isActive()) {
-                System.err.printf("[DEBUG] UDP: Closing persistent TCP connection%n");
+                logger.debug("UDP: Closing persistent TCP connection");
                 tcpConnection.close();
                 tcpConnection = null;
             }
@@ -875,49 +957,49 @@ public class JumpServer {
                 currentBatchSize = 0;
                 currentBatchBytes = 0;
             } catch (Exception e) {
-                System.err.printf("Error flushing UDP batch: %s%n", e.getMessage());
+                logger.error("Error flushing UDP batch: {}", e.getMessage());
             }
         }
 
         private void sendBatchWithSplit(ChannelHandlerContext ctx, java.util.List<DatagramPacket> records) {
             if (records.isEmpty()) return;
             
-            System.err.printf("[DEBUG] UDP sendBatchWithSplit: Starting with %d records%n", records.size());
+            logger.debug("UDP sendBatchWithSplit: Starting with {} records", records.size());
             
             ByteBufAllocator alloc = ctx.alloc();
             ByteBuf batchData = alloc.buffer();
             try {
                 // Log total size of records
                 long totalSize = records.stream().mapToLong(pkt -> pkt.content().readableBytes()).sum();
-                System.err.printf("[DEBUG] UDP sendBatchWithSplit: Total records size: %d bytes%n", totalSize);
+                logger.debug("UDP sendBatchWithSplit: Total records size: {} bytes", totalSize);
                 
                 for (DatagramPacket pkt : records) {
                     batchData.writeBytes(pkt.content(), pkt.content().readerIndex(), pkt.content().readableBytes());
                 }
                 
-                System.err.printf("[DEBUG] UDP sendBatchWithSplit: Combined batch size: %d bytes%n", batchData.readableBytes());
+                logger.debug("UDP sendBatchWithSplit: Combined batch size: {} bytes", batchData.readableBytes());
                 
                 ByteBuf compressedData = batchData;
                 if (batchConfig.enable_compression && batchData.readableBytes() > 0) {
-                    System.err.printf("[DEBUG] UDP sendBatchWithSplit: Compressing data...%n");
+                    logger.debug("UDP sendBatchWithSplit: Compressing data...");
                     compressedData = compressData(batchData, alloc);
                     batchData.release();
-                    System.err.printf("[DEBUG] UDP sendBatchWithSplit: Compressed size: %d bytes (compression ratio: %.2f%%)%n", 
+                    logger.debug("UDP sendBatchWithSplit: Compressed size: {} bytes (compression ratio: {:.2f}%)", 
                         compressedData.readableBytes(), 
                         (100.0 * compressedData.readableBytes() / totalSize));
                 } else {
-                    System.err.printf("[DEBUG] UDP sendBatchWithSplit: Compression disabled or empty data%n");
+                    logger.debug("UDP sendBatchWithSplit: Compression disabled or empty data");
                 }
                 
-                System.err.printf("[DEBUG] UDP sendBatchWithSplit: Sending %d records, %d bytes%n", 
+                logger.debug("UDP sendBatchWithSplit: Sending {} records, {} bytes", 
                     records.size(), compressedData.readableBytes());
                 
                 sendBatchViaTcp(ctx, compressedData, records);
             } catch (Throwable t) {
-                System.err.printf("[DEBUG] UDP sendBatchWithSplit: Exception during processing: %s%n", t.getMessage());
+                logger.error("UDP sendBatchWithSplit: Exception during processing: {}", t.getMessage());
                 batchData.release();
                 for (DatagramPacket pkt : records) pkt.content().release();
-                System.err.printf("Error in sendBatchWithSplit (UDP): %s%n", t.getMessage());
+                logger.error("Error in sendBatchWithSplit (UDP): {}", t.getMessage());
             }
         }
 
@@ -934,7 +1016,7 @@ public class JumpServer {
                 // Use existing persistent connection
                 tcpConnection.writeAndFlush(data).addListener(future -> {
                     if (!future.isSuccess()) {
-                        System.err.printf("[DEBUG] UDP sendBatchViaTcp: Send failed - %s%n", future.cause().getMessage());
+                        logger.error("UDP sendBatchViaTcp: Send failed - {}", future.cause().getMessage());
                         if (recordCount > 1) {
                             int mid = recordCount / 2;
                             java.util.List<DatagramPacket> left = records.subList(0, mid);
@@ -942,17 +1024,17 @@ public class JumpServer {
                             sendBatchWithSplit(ctx, new java.util.ArrayList<>(left));
                             sendBatchWithSplit(ctx, new java.util.ArrayList<>(right));
                         } else {
-                            System.err.printf("Failed to send single UDP record: %s%n", future.cause());
+                            logger.error("Failed to send single UDP record: {}", future.cause());
                             records.get(0).content().release();
                         }
                     } else {
-                        System.err.printf("[DEBUG] UDP sendBatchViaTcp: Successfully sent %d records via persistent connection%n", recordCount);
+                        logger.debug("UDP sendBatchViaTcp: Successfully sent {} records via persistent connection", recordCount);
                         for (DatagramPacket pkt : records) pkt.content().release();
                     }
                 });
             } else {
                 // No persistent connection available, queue for retry
-                System.err.printf("[DEBUG] UDP sendBatchViaTcp: No persistent connection, queuing batch%n");
+                logger.debug("UDP sendBatchViaTcp: No persistent connection, queuing batch");
                 for (DatagramPacket pkt : records) {
                     retryQueue.offer(new DatagramPacket(pkt.content().retain(), null));
                 }
@@ -967,7 +1049,7 @@ public class JumpServer {
 
         private void sendBatchViaUdp(ChannelHandlerContext ctx, ByteBuf data, java.util.List<DatagramPacket> records) {
             final int recordCount = records.size();
-            System.err.printf("[DEBUG] UDP sendBatchViaUdp: Sending %d records, %d bytes via UDP to %s:%d%n", 
+            logger.debug("UDP sendBatchViaUdp: Sending {} records, {} bytes via UDP to {}:{}", 
                 recordCount, data.readableBytes(), route.forward.host, route.forward.port);
             
             // Create UDP channel for sending
@@ -982,7 +1064,7 @@ public class JumpServer {
                     
                     f.channel().writeAndFlush(packet).addListener(future -> {
                         if (!future.isSuccess()) {
-                            System.err.printf("[DEBUG] UDP sendBatchViaUdp: Send failed - %s%n", future.cause().getMessage());
+                            logger.error("UDP sendBatchViaUdp: Send failed - {}", future.cause().getMessage());
                             if (recordCount > 1) {
                                 int mid = recordCount / 2;
                                 java.util.List<DatagramPacket> left = records.subList(0, mid);
@@ -990,17 +1072,17 @@ public class JumpServer {
                                 sendBatchWithSplit(ctx, new java.util.ArrayList<>(left));
                                 sendBatchWithSplit(ctx, new java.util.ArrayList<>(right));
                             } else {
-                                System.err.printf("Failed to send single UDP record: %s%n", future.cause());
+                                logger.error("Failed to send single UDP record: {}", future.cause());
                                 records.get(0).content().release();
                             }
                         } else {
-                            System.err.printf("[DEBUG] UDP sendBatchViaUdp: Successfully sent %d records via UDP%n", recordCount);
+                            logger.debug("UDP sendBatchViaUdp: Successfully sent {} records via UDP", recordCount);
                             for (DatagramPacket pkt : records) pkt.content().release();
                         }
                         f.channel().close();
                     });
                 } else {
-                    System.err.printf("[DEBUG] UDP sendBatchViaUdp: Connection failed - %s%n", f.cause().getMessage());
+                    logger.error("UDP sendBatchViaUdp: Connection failed - {}", f.cause().getMessage());
                     data.release();
                     for (DatagramPacket pkt : records) pkt.content().release();
                 }
@@ -1012,12 +1094,48 @@ public class JumpServer {
                 return data.retain(); // Return uncompressed data
             }
             
+            logger.debug("compressData: Starting compression of {} bytes", data.readableBytes());
+            
+            // Log first few bytes of input data
+            if (data.readableBytes() > 0) {
+                byte[] debugInput = new byte[Math.min(32, data.readableBytes())];
+                data.getBytes(data.readerIndex(), debugInput);
+                StringBuilder hexInput = new StringBuilder();
+                for (byte b : debugInput) {
+                    hexInput.append(String.format("%02x ", b));
+                }
+                logger.debug("compressData: Input data first {} bytes (hex): {}", debugInput.length, hexInput.toString());
+                
+                // Also show as string if possible
+                String inputString = new String(debugInput, java.nio.charset.StandardCharsets.UTF_8);
+                logger.debug("compressData: Input data first {} bytes (string): {}", debugInput.length, inputString);
+            }
+            
             // Snappy compression
             byte[] input = new byte[data.readableBytes()];
             data.getBytes(data.readerIndex(), input);
+            
+            logger.debug("compressData: Calling Snappy.compress() with {} bytes", input.length);
             byte[] compressed = Snappy.compress(input);
+            logger.debug("compressData: Snappy.compress() returned {} bytes", compressed.length);
+            
+            // Log first few bytes of compressed data
+            if (compressed.length > 0) {
+                byte[] debugCompressed = new byte[Math.min(32, compressed.length)];
+                System.arraycopy(compressed, 0, debugCompressed, 0, debugCompressed.length);
+                StringBuilder hexCompressed = new StringBuilder();
+                for (byte b : debugCompressed) {
+                    hexCompressed.append(String.format("%02x ", b));
+                }
+                logger.debug("compressData: Compressed data first {} bytes (hex): {}", debugCompressed.length, hexCompressed.toString());
+            }
+            
             ByteBuf result = alloc.buffer(compressed.length);
             result.writeBytes(compressed);
+            
+            logger.debug("compressData: Created ByteBuf with {} bytes, compression ratio: {:.2f}%", 
+                result.readableBytes(), (100.0 * result.readableBytes() / data.readableBytes()));
+            
             return result;
         }
     }
@@ -1058,9 +1176,9 @@ public class JumpServer {
 
     private static void logBind(Route r, ChannelFuture f) {
         if (f.isSuccess())
-            System.out.printf("[%s] listening %s/%d (%s)%n",
+            logger.info("[{}] listening {} / {} ({})",
                     r.name, r.listen.ip, r.listen.port, r.listen.protocol);
         else
-            System.err.printf("[%s] bind failed: %s%n", r.name, f.cause());
+            logger.error("[{}] bind failed: {}", r.name, f.cause());
     }
 }
