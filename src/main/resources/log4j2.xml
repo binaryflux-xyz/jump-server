@@ -51,7 +51,7 @@
         </Root>
         
         <!-- Application Logger -->
-        <Logger name="xyz.binaryflux.jumpserver" level="DEBUG" additivity="false">
+        <Logger name="xyz.binaryflux.jumpserver" level="INFO" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="AsyncFileAppender"/>
         </Logger>
